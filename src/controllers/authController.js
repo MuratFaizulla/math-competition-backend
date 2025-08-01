@@ -3,7 +3,30 @@ const Test = require('../models/Test');
 const Question = require('../models/Question');
 const Settings = require('../models/Settings');
 const { generateToken } = require('../middleware/auth');
-const { generateUniqueTest } = require('../utils/testGenerator');
+
+// Импорт с проверкой
+let generateUniqueTest;
+try {
+  const testGeneratorModule = require('../utils/testGenerator');
+  console.log('testGenerator module imported:', typeof testGeneratorModule);
+  console.log('Available functions:', Object.keys(testGeneratorModule));
+  
+  generateUniqueTest = testGeneratorModule.generateUniqueTest;
+  
+  if (typeof generateUniqueTest !== 'function') {
+    console.error('❌ generateUniqueTest is not a function!');
+    console.error('Type:', typeof generateUniqueTest);
+    console.error('Value:', generateUniqueTest);
+  } else {
+    console.log('✅ generateUniqueTest imported successfully');
+  }
+} catch (importError) {
+  console.error('❌ Error importing testGenerator:', importError);
+  // Создаем fallback функцию
+  generateUniqueTest = async (userId) => {
+    throw new Error('Test generator not available - import failed');
+  };
+}
 
 // Утилитарная функция для валидации email
 const validateEmail = (email) => {
@@ -80,8 +103,12 @@ const getUserResponse = (user, includeExtendedInfo = false) => {
 
 // Регистрация пользователя
 const register = async (req, res) => {
+  let createdUser = null;
+  
   try {
     const { email, password, firstName, lastName } = req.body;
+    
+    console.log(`Registration attempt for email: ${email}`);
     
     // Валидация входных данных
     if (!email || !validateEmail(email)) {
@@ -112,14 +139,37 @@ const register = async (req, res) => {
       });
     }
     
+    // Проверяем импорт функции generateUniqueTest
+    if (typeof generateUniqueTest !== 'function') {
+      console.error('generateUniqueTest is not a function. Import issue detected.');
+      console.error('Type of generateUniqueTest:', typeof generateUniqueTest);
+      return res.status(500).json({
+        error: 'Server Configuration Error',
+        message: 'Test generation system is not properly configured'
+      });
+    }
+    
     // Проверяем, существует ли пользователь с таким email
     const existingUser = await User.findByEmail(email.toLowerCase().trim());
     if (existingUser) {
+      console.log(`Registration failed: User with email ${email} already exists`);
       return res.status(409).json({
         error: 'Registration Failed',
         message: 'User with this email already exists'
       });
     }
+    
+    // Проверяем наличие активных вопросов перед созданием пользователя
+    const activeQuestionsCount = await Question.countDocuments({ isActive: true });
+    if (activeQuestionsCount === 0) {
+      console.error('No active questions found in database');
+      return res.status(500).json({
+        error: 'System Error',
+        message: 'No questions available for test generation. Please contact administrator.'
+      });
+    }
+    
+    console.log(`Found ${activeQuestionsCount} active questions for test generation`);
     
     // Создаем нового пользователя
     const user = new User({
@@ -129,49 +179,124 @@ const register = async (req, res) => {
       lastName: lastName.trim()
     });
     
+    // Сохраняем пользователя
     await user.save();
+    createdUser = user; // Сохраняем ссылку для возможной очистки
+    
+    console.log(`✅ User created successfully: ${user._id}, email: ${user.email}`);
     
     // Генерируем уникальный тест для пользователя
-    const test = await generateUniqueTest(user._id);
-    if (!test) {
-      // Если не удалось создать тест, удаляем пользователя
-      await User.findByIdAndDelete(user._id);
-      return res.status(500).json({
-        error: 'Registration Failed',
-        message: 'Failed to create test for user'
-      });
+    let test;
+    try {
+      console.log(`Starting test generation for user: ${user._id}`);
+      test = await generateUniqueTest(user._id);
+      
+      if (!test || !test._id) {
+        throw new Error('Test generation returned invalid result');
+      }
+      
+      console.log(`✅ Test created successfully: ${test._id} for user: ${user._id}`);
+      
+    } catch (testError) {
+      console.error('Error creating test for user:', testError);
+      
+      // Пытаемся создать простой тест как fallback
+      try {
+        console.log('Attempting to create fallback test...');
+        
+        // Получаем несколько случайных вопросов для fallback теста
+        const fallbackQuestions = await Question.find({ isActive: true }).limit(10);
+        
+        if (fallbackQuestions.length === 0) {
+          throw new Error('No questions available even for fallback');
+        }
+        
+        test = new Test({
+          userId: user._id,
+          questions: fallbackQuestions.map(q => q._id),
+          answers: [],
+          isCompleted: false,
+          score: 0,
+          maxScore: fallbackQuestions.length,
+          startedAt: null,
+          completedAt: null,
+          timeSpent: 0
+        });
+        
+        await test.save();
+        console.log(`✅ Fallback test created successfully: ${test._id}`);
+        
+      } catch (fallbackError) {
+        console.error('Fallback test creation also failed:', fallbackError);
+        throw new Error(`Failed to create test: ${testError.message}`);
+      }
     }
     
     // Обновляем пользователя с ID теста
     user.testId = test._id;
     await user.save();
     
+    console.log(`✅ User ${user._id} updated with testId: ${test._id}`);
+    
     // Генерируем JWT токен
     const token = generateToken(user);
     
     // Получаем настройки для отправки клиенту
-    const settings = await Settings.getCurrentSettings();
+    let testConfig = null;
+    try {
+      const settings = await Settings.getCurrentSettings();
+      testConfig = settings ? settings.getClientConfig() : null;
+    } catch (settingsError) {
+      console.error('Error getting settings:', settingsError);
+      // Продолжаем без настроек
+    }
+    
+    console.log(`✅ Registration completed successfully for user: ${user._id}`);
     
     res.status(201).json({
       message: 'User registered successfully',
       token,
       user: getUserResponse(user),
-      testConfig: settings ? settings.getClientConfig() : null
+      testConfig
     });
     
   } catch (error) {
     console.error('Registration error:', error);
+    console.error('Error stack:', error.stack);
     
-    // Обработка ошибки дублирования email на уровне базы данных
+    // Если пользователь был создан, но произошла ошибка после этого
+    if (createdUser && createdUser._id) {
+      try {
+        console.log(`Attempting cleanup: deleting user ${createdUser._id}`);
+        
+        // Удаляем связанный тест если он был создан
+        if (createdUser.testId) {
+          await Test.findByIdAndDelete(createdUser.testId);
+          console.log(`Deleted test ${createdUser.testId} during cleanup`);
+        }
+        
+        // Удаляем пользователя
+        await User.findByIdAndDelete(createdUser._id);
+        console.log(`✅ User ${createdUser._id} deleted during cleanup`);
+        
+      } catch (deleteError) {
+        console.error(`❌ Failed to cleanup user ${createdUser._id}:`, deleteError);
+        // Критическая ошибка - логируем для мониторинга
+        console.error(`🚨 MANUAL CLEANUP REQUIRED: Orphaned user ${createdUser._id} with email ${createdUser.email}`);
+      }
+    }
+    
+    // Обработка специфичных ошибок
     if (error.code === 11000) {
+      // Дублирование email на уровне базы данных
       return res.status(409).json({
         error: 'Registration Failed',
         message: 'User with this email already exists'
       });
     }
     
-    // Обработка ошибок валидации mongoose
     if (error.name === 'ValidationError') {
+      // Ошибки валидации mongoose
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
         error: 'Validation Error',
@@ -179,9 +304,26 @@ const register = async (req, res) => {
       });
     }
     
+    if (error.message.includes('questions') || error.message.includes('test')) {
+      // Ошибки связанные с тестированием
+      return res.status(500).json({
+        error: 'Registration Failed',
+        message: 'Unable to prepare test for user. Please try again or contact support.'
+      });
+    }
+    
+    if (error.message.includes('Configuration')) {
+      // Ошибки конфигурации системы
+      return res.status(500).json({
+        error: 'System Error',
+        message: 'System configuration issue. Please contact administrator.'
+      });
+    }
+    
+    // Общая ошибка сервера
     res.status(500).json({
       error: 'Registration Failed',
-      message: 'Internal server error during registration'
+      message: 'Internal server error during registration. Please try again.'
     });
   }
 };
@@ -190,6 +332,8 @@ const register = async (req, res) => {
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
+    
+    console.log(`Login attempt for email: ${email}`);
     
     // Валидация входных данных
     if (!email || !password) {
@@ -202,6 +346,7 @@ const login = async (req, res) => {
     // Находим пользователя по email
     const user = await User.findByEmail(email.toLowerCase().trim());
     if (!user) {
+      console.log(`Login failed: User not found for email ${email}`);
       return res.status(401).json({
         error: 'Login Failed',
         message: 'Invalid email or password'
@@ -211,6 +356,7 @@ const login = async (req, res) => {
     // Проверяем пароль
     const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
+      console.log(`Login failed: Invalid password for user ${user._id}`);
       return res.status(401).json({
         error: 'Login Failed',
         message: 'Invalid email or password'
@@ -219,6 +365,7 @@ const login = async (req, res) => {
     
     // Проверяем активность аккаунта
     if (!user.isActive) {
+      console.log(`Login failed: Account deactivated for user ${user._id}`);
       return res.status(401).json({
         error: 'Login Failed',
         message: 'Account is deactivated'
@@ -230,10 +377,12 @@ const login = async (req, res) => {
     // Если у пользователя нет теста, создаем новый (для старых пользователей)
     if (!user.testId) {
       try {
+        console.log(`Creating test for existing user: ${user._id}`);
         const test = await generateUniqueTest(user._id);
         if (test) {
           user.testId = test._id;
           needsSave = true;
+          console.log(`✅ Test created for existing user: ${test._id}`);
         }
       } catch (testError) {
         console.error('Error creating test for existing user:', testError);
@@ -253,17 +402,26 @@ const login = async (req, res) => {
     const token = generateToken(user);
     
     // Получаем настройки для отправки клиенту
-    const settings = await Settings.getCurrentSettings();
+    let testConfig = null;
+    try {
+      const settings = await Settings.getCurrentSettings();
+      testConfig = settings ? settings.getClientConfig() : null;
+    } catch (settingsError) {
+      console.error('Error getting settings during login:', settingsError);
+      // Продолжаем без настроек
+    }
     
     // Получаем информацию о тесте пользователя
     const testInfo = await getTestInfo(user.testId);
+    
+    console.log(`✅ Login successful for user: ${user._id}`);
     
     res.json({
       message: 'Login successful',
       token,
       user: getUserResponse(user, true),
       test: testInfo,
-      testConfig: settings ? settings.getClientConfig() : null
+      testConfig
     });
     
   } catch (error) {
@@ -287,8 +445,17 @@ const getProfile = async (req, res) => {
       });
     }
     
+    console.log(`Profile request for user: ${user._id}`);
+    
     // Получаем настройки
-    const settings = await Settings.getCurrentSettings();
+    let testConfig = null;
+    try {
+      const settings = await Settings.getCurrentSettings();
+      testConfig = settings ? settings.getClientConfig() : null;
+    } catch (settingsError) {
+      console.error('Error getting settings for profile:', settingsError);
+      // Продолжаем без настроек
+    }
     
     // Получаем информацию о тесте с результатами если тест завершен
     const testInfo = await getTestInfo(user.testId, true);
@@ -296,7 +463,7 @@ const getProfile = async (req, res) => {
     res.json({
       user: getUserResponse(user, true),
       test: testInfo,
-      testConfig: settings ? settings.getClientConfig() : null
+      testConfig
     });
     
   } catch (error) {
@@ -320,6 +487,8 @@ const updateProfile = async (req, res) => {
         message: 'User not found'
       });
     }
+    
+    console.log(`Profile update request for user: ${user._id}`);
     
     // Валидация данных
     if (firstName !== undefined && !validateName(firstName)) {
@@ -360,6 +529,8 @@ const updateProfile = async (req, res) => {
     if (lastName !== undefined) user.lastName = lastName.trim();
     
     await user.save();
+    
+    console.log(`✅ Profile updated for user: ${user._id}`);
     
     res.json({
       message: 'Profile updated successfully',
@@ -406,6 +577,8 @@ const changePassword = async (req, res) => {
       });
     }
     
+    console.log(`Password change request for user: ${user._id}`);
+    
     // Валидация входных данных
     if (!currentPassword || !newPassword) {
       return res.status(400).json({
@@ -424,6 +597,7 @@ const changePassword = async (req, res) => {
     // Проверяем текущий пароль
     const isCurrentPasswordValid = await user.comparePassword(currentPassword);
     if (!isCurrentPasswordValid) {
+      console.log(`Password change failed: Invalid current password for user ${user._id}`);
       return res.status(401).json({
         error: 'Password Change Failed',
         message: 'Current password is incorrect'
@@ -442,6 +616,8 @@ const changePassword = async (req, res) => {
     // Обновляем пароль
     user.password = newPassword;
     await user.save();
+    
+    console.log(`✅ Password changed for user: ${user._id}`);
     
     res.json({
       message: 'Password changed successfully'
@@ -468,6 +644,7 @@ const logout = async (req, res) => {
       try {
         user.lastLogout = new Date();
         await user.save();
+        console.log(`✅ Logout recorded for user: ${user._id}`);
       } catch (saveError) {
         console.error('Error updating logout time:', saveError);
         // Не прерываем выход из-за ошибки сохранения
@@ -498,6 +675,8 @@ const checkTestAvailability = async (req, res) => {
         message: 'User not found'
       });
     }
+    
+    console.log(`Test availability check for user: ${user._id}`);
     
     const settings = await Settings.getCurrentSettings();
     if (!settings) {

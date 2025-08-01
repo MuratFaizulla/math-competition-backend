@@ -9,48 +9,79 @@ const Settings = require('../models/Settings');
  */
 const generateUniqueTest = async (userId) => {
   try {
+    console.log(`Starting test generation for user: ${userId}`);
+    
     // Получаем настройки
     const settings = await Settings.getCurrentSettings();
-    const questionsPerTest = settings.questionsPerTest;
+    if (!settings) {
+      throw new Error('Test settings not found');
+    }
+    
+    const questionsPerTest = settings.questionsPerTest || 30; // fallback значение
+    console.log(`Questions per test: ${questionsPerTest}`);
     
     // Проверяем, есть ли уже тест у пользователя
     const existingTest = await Test.findOne({ userId });
     if (existingTest) {
+      console.log(`Existing test found for user ${userId}: ${existingTest._id}`);
       return existingTest;
     }
     
     // Получаем общее количество активных вопросов
     const totalQuestions = await Question.countDocuments({ isActive: true });
+    console.log(`Total active questions available: ${totalQuestions}`);
+    
+    if (totalQuestions === 0) {
+      throw new Error('No active questions found in database');
+    }
     
     if (totalQuestions < questionsPerTest) {
-      throw new Error(`Not enough questions available. Need ${questionsPerTest}, but only ${totalQuestions} found.`);
+      console.warn(`Not enough questions available. Need ${questionsPerTest}, but only ${totalQuestions} found. Using all available questions.`);
     }
+    
+    const actualQuestionsCount = Math.min(questionsPerTest, totalQuestions);
     
     // Получаем случайные вопросы
     let randomQuestions;
     
-    if (settings.randomizeQuestions) {
-      // Если настроена рандомизация, используем сбалансированную выборку
-      randomQuestions = await getBalancedRandomQuestions(questionsPerTest);
-    } else {
-      // Простая случайная выборка
-      randomQuestions = await Question.getRandomQuestions(questionsPerTest);
+    try {
+      if (settings.randomizeQuestions) {
+        // Если настроена рандомизация, используем сбалансированную выборку
+        console.log('Using balanced random question selection');
+        randomQuestions = await getBalancedRandomQuestions(actualQuestionsCount);
+      } else {
+        // Простая случайная выборка
+        console.log('Using simple random question selection');
+        randomQuestions = await getSimpleRandomQuestions(actualQuestionsCount);
+      }
+    } catch (questionError) {
+      console.error('Error getting random questions:', questionError);
+      // Fallback к простой выборке
+      randomQuestions = await getSimpleRandomQuestions(actualQuestionsCount);
     }
     
-    if (randomQuestions.length < questionsPerTest) {
-      throw new Error(`Could not generate enough unique questions. Generated ${randomQuestions.length}, needed ${questionsPerTest}.`);
+    if (!randomQuestions || randomQuestions.length === 0) {
+      throw new Error('Could not retrieve any questions for test generation');
     }
+    
+    console.log(`Selected ${randomQuestions.length} questions for test`);
     
     // Создаем тест
     const test = new Test({
       userId,
       questions: randomQuestions.map(q => q._id),
-      maxScore: randomQuestions.reduce((sum, q) => sum + (q.points || 1), 0)
+      answers: [],
+      isCompleted: false,
+      score: 0,
+      maxScore: randomQuestions.reduce((sum, q) => sum + (q.points || 1), 0),
+      startedAt: null,
+      completedAt: null,
+      timeSpent: 0
     });
     
     await test.save();
     
-    console.log(`✅ Generated unique test for user ${userId} with ${randomQuestions.length} questions`);
+    console.log(`✅ Generated unique test ${test._id} for user ${userId} with ${randomQuestions.length} questions`);
     
     return test;
     
@@ -61,16 +92,51 @@ const generateUniqueTest = async (userId) => {
 };
 
 /**
+ * Простая случайная выборка вопросов
+ * @param {number} count - Количество вопросов
+ * @returns {Array} - Массив вопросов
+ */
+const getSimpleRandomQuestions = async (count) => {
+  try {
+    // Используем aggregate с $sample для случайной выборки
+    const questions = await Question.aggregate([
+      { $match: { isActive: true } },
+      { $sample: { size: count } }
+    ]);
+    
+    console.log(`Retrieved ${questions.length} questions using simple random selection`);
+    return questions;
+    
+  } catch (error) {
+    console.error('Error in simple random question selection:', error);
+    
+    // Fallback - получаем все вопросы и перемешиваем
+    try {
+      const allQuestions = await Question.find({ isActive: true }).limit(count * 2);
+      const shuffled = shuffleArray(allQuestions);
+      return shuffled.slice(0, count);
+    } catch (fallbackError) {
+      console.error('Fallback question selection also failed:', fallbackError);
+      throw new Error('Unable to retrieve questions');
+    }
+  }
+};
+
+/**
  * Генерирует сбалансированную выборку вопросов по сложности
  * @param {number} totalQuestions - Общее количество вопросов
  * @returns {Array} - Массив вопросов
  */
 const getBalancedRandomQuestions = async (totalQuestions) => {
   try {
+    console.log(`Generating balanced question set for ${totalQuestions} questions`);
+    
     // Определяем распределение по сложности (40% easy, 40% medium, 20% hard)
     const easyCount = Math.floor(totalQuestions * 0.4);
     const mediumCount = Math.floor(totalQuestions * 0.4);
     const hardCount = totalQuestions - easyCount - mediumCount;
+    
+    console.log(`Target distribution - Easy: ${easyCount}, Medium: ${mediumCount}, Hard: ${hardCount}`);
     
     // Получаем вопросы по каждой категории сложности
     const [easyQuestions, mediumQuestions, hardQuestions] = await Promise.all([
@@ -79,15 +145,37 @@ const getBalancedRandomQuestions = async (totalQuestions) => {
       getQuestionsByDifficulty('hard', hardCount)
     ]);
     
+    console.log(`Retrieved - Easy: ${easyQuestions.length}, Medium: ${mediumQuestions.length}, Hard: ${hardQuestions.length}`);
+    
     // Объединяем и перемешиваем
     const allQuestions = [...easyQuestions, ...mediumQuestions, ...hardQuestions];
+    
+    // Если не хватает вопросов, дополняем любыми доступными
+    if (allQuestions.length < totalQuestions) {
+      const usedIds = allQuestions.map(q => q._id);
+      const additionalCount = totalQuestions - allQuestions.length;
+      
+      const additionalQuestions = await Question.aggregate([
+        { 
+          $match: { 
+            isActive: true,
+            _id: { $nin: usedIds }
+          }
+        },
+        { $sample: { size: additionalCount } }
+      ]);
+      
+      allQuestions.push(...additionalQuestions);
+      console.log(`Added ${additionalQuestions.length} additional questions`);
+    }
     
     return shuffleArray(allQuestions);
     
   } catch (error) {
     console.error('Error generating balanced questions:', error);
     // Fallback к простой случайной выборке
-    return await Question.getRandomQuestions(totalQuestions);
+    console.log('Falling back to simple random selection');
+    return await getSimpleRandomQuestions(totalQuestions);
   }
 };
 
@@ -99,6 +187,8 @@ const getBalancedRandomQuestions = async (totalQuestions) => {
  */
 const getQuestionsByDifficulty = async (difficulty, count) => {
   try {
+    if (count <= 0) return [];
+    
     const questions = await Question.aggregate([
       { $match: { isActive: true, difficulty } },
       { $sample: { size: count } }
@@ -230,7 +320,7 @@ const getTestGenerationStats = async () => {
       totalTests,
       totalQuestions,
       difficultyDistribution: difficultyStats,
-      canGenerateTests: totalQuestions >= 30
+      canGenerateTests: totalQuestions >= 10 // Минимум 10 вопросов для генерации
     };
     
   } catch (error) {
@@ -242,4 +332,16 @@ const getTestGenerationStats = async () => {
       canGenerateTests: false
     };
   }
+};
+
+// ВАЖНО: Экспорт всех функций
+module.exports = {
+  generateUniqueTest,
+  getBalancedRandomQuestions,
+  getQuestionsByDifficulty,
+  getSimpleRandomQuestions,
+  shuffleArray,
+  generateMultipleTests,
+  regenerateTest,
+  getTestGenerationStats
 };
